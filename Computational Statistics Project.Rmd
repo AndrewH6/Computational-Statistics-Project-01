@@ -1,0 +1,305 @@
+---
+title: '20200330'
+author: "Andrew Huang"
+date: "3/30/2020"
+output:
+  pdf_document: default
+  html_document:
+    df_print: paged
+---
+
+```{r setup, include=FALSE}
+library(SparseM)
+library(quantreg)
+
+library(lss)
+library(lss2)
+
+library(tidyverse)
+library(Rcpp)
+library(optimization)
+library(optimx)
+library(survival)
+library(KMsurv)
+library(knitr)
+```
+
+```{r}
+########## NEW gweight 20200218 ###########
+
+
+
+gweight <- function(data,time,status){
+  
+  ##########
+  n <- dim(data)[1]
+  status[n] <- 1
+  data01 <- data.frame(time,status)
+  
+  ##########
+  KM.est<-KMestimator(time, status)
+  data02 <- KM.est[[2]]
+  rn <- dim(data02)[1]
+  weight <- rep(0,rn)
+  KM01 <- c(1,data02$KM)
+  
+  ##########
+  for(i in 1:rn){
+    weight[i] <- (KM01[i] - KM01[i+1])*n
+  }
+  
+  ##########
+  data02_1 <- data.frame(data02[,c('UZ','D','KM')],weight)
+  n21 <- dim(data02_1)[1]
+  rdata <- data.frame()
+  
+  ##########
+  for(i in 1:n21){
+    
+    if(data02_1$D[i] > 1){
+      w1 <- rep(data02_1$weight[i]/data02_1$D[i],data02_1$D[i])
+      time <- rep(data02_1$UZ[i],data02_1$D[i])
+      status <- rep(1,data02_1$D[i])
+      td <- data.frame(time,status,w1)
+    } else {
+      w1 <- data02_1$weight[i]
+      time <- data02_1$UZ[i]
+      status <- 1
+      td <- data.frame(time,status,w1)
+    }
+    
+    rdata <- rbind(rdata,td)
+  }
+  
+  ##########
+  data03_1 <- data.frame(data01[data01$status == 1,],w1 = rdata$w1)
+  data03_2 <- data.frame(data01[data01$status == 0,],w1 = 0)
+  data03 <- rbind(data03_1,data03_2) %>% arrange(time,-status)
+  data_r <- data.frame(data,w1=data03$w1)
+  
+  
+  
+  return(data_r)
+}
+
+###########
+
+get_synthetic <- function(data,time,status,w1){
+  data_01 <- data %>% arrange(time)
+  n_1 <- dim(data_01)[1]
+  
+  w2 <- w1
+  data_01 <- cbind(data_01,w2)
+  
+  if(data_01[n_1,"status"] == 0){data_01[n_1,"w2"] <- 0}
+  
+  synthe <- numeric(n_1)
+  
+  for(j in 2:n_1){
+    synthe[j] <- (data_01$time[j]-data_01$time[j-1])*data_01$w2[j]
+  }
+  
+  data_01 <- cbind(data_01,synthe)
+  
+  Ag1 <- numeric(n_1)
+  Ag1[1] <- data_01$time[1]
+  
+  for(j in 2:n_1){
+    Ag1[j] <- Ag1[1] + sum(synthe[2:j])
+  }
+  
+  data_01 <- cbind(data_01,Ag1)
+  
+  return(data_01)
+}
+```
+
+
+```{r}
+data_nlminb_cau <- read.csv("dataD-nlminb-cau.csv")
+
+data_nlminb_t12 <- read.csv("dataD-nlminb-t12.csv")
+
+data_nlminb_bst <- read.csv("dataD-nlminb-bst.csv")
+
+```
+
+```{r}
+########## Obtain Kaplan-Meier estimate with the self-written functions;
+KMestimator <- function (Z,delta) 
+{ UZ<-unique(Z)      #Unique observed times;
+N<-length(UZ)
+UZ.order<-order(UZ)
+UZ<-UZ[UZ.order]            #sort data;
+KM <- rep(0,N)
+Y<-rep(0,N)
+D<-rep(0,N)
+D[1]<-sum(Z[delta==1]==UZ[1])
+Y[1]<-sum(Z >= UZ[1])
+KM[1] <- 1-D[1]/Y[1]            #this is for right continuous value
+for (i in 2: N){
+  D[i]<-sum(Z[delta==1]==UZ[i])
+  Y[i]<-sum(Z >= UZ[i])
+  KM[i] <- KM[i-1]*(1-D[i]/Y[i])
+}
+
+# Calculate variance and sdandard error;
+sigma2.s<-rep(0,N)
+for (i in 1: N){
+  if (D[i]==Y[i]){
+    sigma2.s[i]=0    #assign an arbitrary value, it does not affect the results;
+  }
+  else{
+    sigma2.s[i]<-sum( (UZ[1:i]<=UZ[i])*(D[1:i]/(Y[1:i]*(Y[1:i]-D[1:i]))))  
+  } 
+  ## sigma2.s[i]<-sum( (UZ<=UZ[i])*(D/(Y*(Y-D))) ) #old version
+  ##  Note the data is sorted by UZ;
+  ##  Using this to avoid NaN for times smaller than the largest observation;
+}
+KM.var<-KM^2*sigma2.s
+KM.se<-sqrt(KM.var)
+
+Full<-data.frame(UZ,D,Y,KM,sigma2.s,KM.var,KM.se)
+Reduced<-subset(Full, (Full$D>0))
+list(Full, Reduced)
+}
+
+
+########## NewMethod using W_Prime
+
+f_function_MD01_i <- function(beta_c,age=data_i$sage,age2=data_i$sage2,time=data_i$stime,w1=data_i$wp){
+  beta0 <- beta_c[1]
+  beta1 <- beta_c[2]
+  beta2 <- beta_c[3]
+  
+  n <- length(age)
+  
+  f_function_MD01_i = sum( (log10(time) - (beta0*rep(1,n)+age*beta1+age2*beta2))^2 * w1 )
+  return(f_function_MD01_i)
+}
+
+
+########## Type I Discrete using W1
+
+f_function_MD02_i <- function(beta_c,age=data_i$sage,age2=data_i$sage2,time=data_i$stime,w1=data_i$w1){
+  beta0 <- beta_c[1]
+  beta1 <- beta_c[2]
+  beta2 <- beta_c[3]
+  
+  n <- length(age)
+  
+  f_function_MD02_i = sum(( 
+    ifelse(log10(time) >=0,sqrt(log10(time)),0) - 
+      ifelse(beta0*rep(1,n)+age*beta1+age2*beta2>=0,sqrt(beta0*rep(1,n)+age*beta1+age2*beta2),0)
+  )^2 * w1)
+  return(f_function_MD02_i)
+}
+
+
+########## Least Square Method by Zhou 
+
+f_function_MD03_i <- function(beta_c,age=data_i$sage,age2=data_i$sage2,time=data_i$stime,w1=data_i$w1){
+  beta0 <- beta_c[1]
+  beta1 <- beta_c[2]
+  beta2 <- beta_c[3]
+  
+  n <- length(age)
+  
+  f_function_MD03_i = sum( (log10(time) - (beta0*rep(1,n)+age*beta1+age2*beta2))^2 * w1 )
+  return(f_function_MD03_i)
+}
+
+
+########## Least Absolute Deviation by Zhou 
+
+f_function_MD032_i <- function(beta_c,age=data_i$sage,age2=data_i$sage2,time=data_i$stime,w1=data_i$w1){
+  beta0 <- beta_c[1]
+  beta1 <- beta_c[2]
+  beta2 <- beta_c[3]
+  
+  n <- length(age)
+  
+  f_function_MD032_i = sum( abs(log10(time) - (beta0*rep(1,n)+age*beta1+age2*beta2)) * w1 )
+  return(f_function_MD032_i)
+}
+```
+
+
+```{r}
+get_mean_2 <- function(data = D_BFGS){
+  intercept_mean_0 <- mean(data$ps_1v)
+  age_mean_0 <- mean(data$ps_2v)
+  age2_mean_0 <- mean(data$ps_3v)
+  output0 <- c(intercept_mean_0,age_mean_0,age2_mean_0)
+  names(output0) <- c("Intercept","Age","Age2")
+  print(output0)
+  
+  intercept_mean_0_1 <- mean(data$ps1_1v)
+  age_mean_0_1 <- mean(data$ps1_2v)
+  age2_mean_0_1 <- mean(data$ps1_3v)
+  output0_1 <- c(intercept_mean_0_1,age_mean_0_1,age2_mean_0_1)
+  names(output0_1) <- c("Intercept","Age","Age2")
+  print(output0_1)
+  
+  intercept_mean_1 <- mean(data$p1_1v)
+  age_mean_1 <- mean(data$p1_2v)
+  age2_mean_1 <- mean(data$p1_3v)
+  output1 <- c(intercept_mean_1,age_mean_1,age2_mean_1)
+  names(output1) <- c("Intercept","Age","Age2")
+  print(output1)
+  
+    intercept_mean_0_2 <- mean(data$ps2_1v)
+  age_mean_0_2 <- mean(data$ps2_2v)
+  age2_mean_0_2 <- mean(data$ps2_3v)
+  output0_2 <- c(intercept_mean_0_2,age_mean_0_2,age2_mean_0_2)
+  names(output0_2) <- c("Intercept","Age","Age2")
+  print(output0_2)
+  
+  intercept_mean_2 <- mean(data$p2_1v)
+  age_mean_2 <- mean(data$p2_2v)
+  age2_mean_2 <- mean(data$p2_3v)
+  output2 <- c(intercept_mean_2,age_mean_2,age2_mean_2)
+  names(output2) <- c("Intercept","Age","Age2")
+  print(output2)
+  
+  intercept_mean_3 <- mean(data$p3_1v)
+  age_mean_3 <- mean(data$p3_2v)
+  age2_mean_3 <- mean(data$p3_3v)
+  output3 <- c(intercept_mean_3,age_mean_3,age2_mean_3)
+  names(output3) <- c("Intercept","Age","Age2")
+  print(output3)
+  
+  intercept_mean_32 <- mean(data$p32_1v)
+  age_mean_32 <- mean(data$p32_2v)
+  age2_mean_32 <- mean(data$p32_3v)
+  output32 <- c(intercept_mean_32,age_mean_32,age2_mean_32)
+  names(output32) <- c("Intercept","Age","Age2")
+  print(output32)
+  
+  age_mean_bj <- mean(data$pbj_2v, na.rm = TRUE)
+  age2_mean_bj <- mean(data$pbj_3v, na.rm = TRUE)
+  outputbj <- c(age_mean_bj,age2_mean_bj)
+  names(outputbj) <- c("Age","Age2")
+  print(outputbj)
+}
+```
+
+\newpage
+
+```{r}
+get_mean_2(data_nlminb_cau)
+```
+
+\newpage
+
+```{r}
+get_mean_2(data_nlminb_t12)
+```
+
+\newpage
+
+
+```{r}
+get_mean_2(data_nlminb_bst)
+```
+
